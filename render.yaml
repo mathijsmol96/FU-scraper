@@ -1,14 +1,14 @@
 services:
   - type: web
-    name: funda-scraper-api
-    env: python
+    name: funda-scraper
+    runtime: python
+    region: frankfurt
     plan: free
-    buildCommand: pip install -r requirements.txt && PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install chromium
+    pythonVersion: 3.13.4
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "0"
-      - key: PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS
-        value: "true"
-      - key: PYTHONUNBUFFERED
+      - key: HEADLESS
         value: "1"
+      - key: MAX_PAGES
+        value: "3"
