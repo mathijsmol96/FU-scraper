@@ -1,4 +1,4 @@
-# api.py — volledige API met Playwright (sync) + no-sandbox
+# api.py — FastAPI + Playwright (sync) met robuuste scraping en foutafhandeling
 from fastapi import FastAPI, Query
 from typing import List, Dict, Any
 from bs4 import BeautifulSoup
@@ -12,14 +12,132 @@ def health():
     return {"ok": True}
 
 
-def scrape_funda(max_pages: int = 1) -> List[Dict[str, Any]]:
+def _new_context(p):
     """
-    Heel eenvoudige scraper om de basis te demonstreren.
-    Past mogelijk aan als Funda de HTML wijzigt.
+    Maakt een browser context die op echte Chrome lijkt en NL-headers gebruikt.
+    Extra flags helpen in container-omgevingen zoals Render.
     """
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
+    )
+
+    # Echte UA + NL headers. Dit voorkomt vaak blokkades / lege pagina's.
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        locale="nl-NL",
+        extra_http_headers={
+            "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        viewport={"width": 1366, "height": 768},
+    )
+    return browser, context
+
+
+def _click_cookie_consent(page):
+    # Probeer populaire cookie/consent knoppen; negeer errors.
+    candidates = [
+        "#didomi-notice-agree-button",
+        "button[aria-label='Akkoord']",
+        "button:has-text('Akkoord')",
+        "button:has-text('Accepteren')",
+        "button:has-text('Accepteer')",
+    ]
+    for sel in candidates:
+        try:
+            page.click(sel, timeout=2000)
+            return
+        except Exception:
+            pass
+
+
+def _parse_listings(html: str) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) Probeer data-testid container (meestal het stabielst)
+    cards = soup.select("article[data-testid='search-result-item']")
+    # 2) Fallback op div met zelfde testid
+    if not cards:
+        cards = soup.select("div[data-testid='search-result-item']")
+    # 3) Laatste redmiddel: tailwind-achtige container (kan wisselen)
+    if not cards:
+        cards = soup.find_all("div", class_="@container border-b pb-3")
+
     results: List[Dict[str, Any]] = []
 
-    # Basiszoek-URL (actuele koop, NL, beschikbaar)
+    for card in cards:
+        data: Dict[str, Any] = {}
+
+        # Link + adres
+        link_el = card.select_one("a[data-testid='listingDetailsAddress']") or card.find("a")
+        href = link_el.get("href", "") if link_el else ""
+        if href and href.startswith("/"):
+            href = "https://www.funda.nl" + href
+        data["link"] = href or ""
+
+        # Adres-tekst
+        # 1) Probeer testid-address
+        address_text = ""
+        addr = card.select_one("[data-testid='listingDetailsAddress']")
+        if addr:
+            address_text = addr.get_text(strip=True, separator=" ")
+        # 2) Fallback op iets als 'flex font-semibold'
+        if not address_text:
+            street_div = card.find("div", class_="flex font-semibold")
+            if street_div:
+                address_text = street_div.get_text(strip=True, separator=" ")
+        # 3) Als nog leeg: pak de link-tekst
+        if not address_text and link_el:
+            address_text = link_el.get_text(strip=True, separator=" ")
+        data["adres"] = address_text or "N/B"
+
+        # Plaats
+        plaats = ""
+        sub = card.select_one("[data-testid='result-item-subtitle']")
+        if sub:
+            plaats = sub.get_text(strip=True)
+        if not plaats:
+            loc_div = card.find("div", class_="truncate text-neutral-80")
+            if loc_div:
+                plaats = loc_div.get_text(strip=True)
+        data["stad_dorp"] = plaats or "N/B"
+
+        # Prijs
+        prijs_el = card.select_one("[data-testid='result-item-price']")
+        data["prijs"] = prijs_el.get_text(strip=True) if prijs_el else "N/B"
+
+        # Makelaar (kan ontbreken)
+        makelaar = ""
+        # soms zit het in een container met link naar de makelaar
+        realtor_container = card.find("div", class_="flex w-full justify-between")
+        if realtor_container:
+            a = realtor_container.find("a")
+            if a:
+                span = a.find("span")
+                if span:
+                    makelaar = span.get_text(strip=True)
+        data["makelaar"] = makelaar or "N/B"
+
+        results.append(data)
+
+    return results
+
+
+def scrape_funda(max_pages: int = 1) -> Dict[str, Any]:
+    """
+    Scraper die altijd JSON-structuur teruggeeft.
+    Bij fouten krijg je een 'error' veld, i.p.v. 500 HTML.
+    """
     base_url = (
         "https://www.funda.nl/zoeken/koop"
         "?selected_area=[%22nl%22]"
@@ -27,73 +145,62 @@ def scrape_funda(max_pages: int = 1) -> List[Dict[str, Any]]:
         "&availability=[%22available%22]"
     )
 
+    last_url = None
+    all_items: List[Dict[str, Any]] = []
+
     with sync_playwright() as p:
-        # Belangrijk: --no-sandbox voor Render-omgevingen
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context()
-        page = context.new_page()
-
-        # Cookies accepteren (als aanwezig)
-        page.goto("https://www.funda.nl", wait_until="domcontentloaded")
         try:
-            page.click("#didomi-notice-agree-button", timeout=4000)
-        except Exception:
-            pass
+            browser, context = _new_context(p)
+            page = context.new_page()
 
-        # Pagina's doorlopen
-        for i in range(1, max_pages + 1):
-            url = f"{base_url}&search_result={i}" if i > 1 else base_url
-            page.goto(url, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)  # klein moment zodat de kaarten laden
+            # 1) homepage: cookies wegklikken
+            page.goto("https://www.funda.nl", wait_until="domcontentloaded", timeout=45000)
+            _click_cookie_consent(page)
 
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
+            # 2) result pages
+            for i in range(1, max_pages + 1):
+                last_url = f"{base_url}&search_result={i}" if i > 1 else base_url
+                page.goto(last_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(1200)  # even ademruimte voor renderen
 
-            # Kaarten vinden (selectors kunnen variëren in de tijd)
-            cards = soup.find_all("div", class_="@container border-b pb-3")
-            if not cards:
-                break
+                # Probeer te wachten tot er íets van resultaten staat
+                try:
+                    page.wait_for_selector("[data-testid='search-result-item'], article[data-testid='search-result-item']",
+                                           timeout=4000)
+                except Exception:
+                    # niet fataal; we parsen gewoon wat er is
+                    pass
 
-            for card in cards:
-                data: Dict[str, Any] = {}
+                html = page.content()
+                items = _parse_listings(html)
 
-                # Link + adres
-                address_link = card.find("a", attrs={"data-testid": "listingDetailsAddress"})
-                if address_link:
-                    data["link"] = "https://www.funda.nl" + address_link.get("href", "")
-                    street_div = address_link.find("div", class_="flex font-semibold")
-                    data["adres"] = street_div.get_text(strip=True, separator=" ") if street_div else "N/B"
-                else:
-                    data["link"] = ""
-                    data["adres"] = "N/B"
+                if not items:
+                    # Mogelijk anti-bot / lege pagina -> zet debug-info
+                    title = page.title()
+                    all_items.extend([])  # niets, maar we geven debug terug
+                    return {
+                        "count": 0,
+                        "items": [],
+                        "debug": {
+                            "last_url": last_url,
+                            "page_title": title,
+                            "note": "Geen kaarten gevonden. Mogelijk selectors veranderd of anti-bot.",
+                        },
+                    }
 
-                # Plaats
-                loc_div = card.find("div", class_="truncate text-neutral-80")
-                data["stad_dorp"] = loc_div.get_text(strip=True) if loc_div else "N/B"
+                all_items.extend(items)
 
-                # Prijs
-                price = card.find("p", attrs={"data-testid": "result-item-price"})
-                data["prijs"] = price.get_text(strip=True) if price else "N/B"
+            context.close()
+            browser.close()
 
-                # Makelaar (kan ontbreken)
-                realtor_container = card.find("div", class_="flex w-full justify-between")
-                if realtor_container:
-                    realtor_link = realtor_container.find("a")
-                    data["makelaar"] = (
-                        realtor_link.find("span").get_text(strip=True) if realtor_link else "N/B"
-                    )
-                else:
-                    data["makelaar"] = "N/B"
+            return {"count": len(all_items), "items": all_items, "debug": {"last_url": last_url}}
 
-                results.append(data)
-
-        context.close()
-        browser.close()
-
-    return results
-
-
-@app.get("/scrape")
-def scrape(max_pages: int = Query(1, ge=1, le=10)):
-    data = scrape_funda(max_pages=max_pages)
-    return {"count": len(data), "items": data}
+        except Exception as e:
+            # Zorg dat je ALTIJD JSON terugkrijgt
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exceptio
